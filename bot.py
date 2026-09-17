@@ -59,16 +59,59 @@ def build_poll_keyboard(poll_id: int, options: list, counts: dict) -> InlineKeyb
     row = []
     for i, (option_id, option_text) in enumerate(options):
         count = counts.get(option_id, 0)
-        label = f"📊 {count} | 💎 {option_text}"
-        row.append(InlineKeyboardButton(label, callback_data=f"vote:{poll_id}:{option_id}"))
+        # বাটন সবসময় আকাশি (sky blue) থাকবে — কে ভোট দিয়েছে তার ভিত্তিতে রঙ বদলাবে না,
+        # একই অপশনে একাধিক মানুষ ভোট দিতে পারবে
+        style = "primary"
+        label = f"🔷 {option_text} ({count})" if count else f"🔷 {option_text}"
+        row.append(
+            InlineKeyboardButton(
+                label, callback_data=f"vote:{poll_id}:{option_id}", style=style
+            )
+        )
         if len(row) == 2:
             rows.append(row)
             row = []
     if row:
         rows.append(row)
     rows.append(
-        [InlineKeyboardButton("🔴 থামান এবং ফলাফল পান", callback_data=f"stop:{poll_id}")]
+        [
+            InlineKeyboardButton(
+                "🔍 আমার ভোট দেখুন",
+                callback_data=f"myvote:{poll_id}",
+            )
+        ]
     )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "🔴 থামান এবং ফলাফল পান",
+                callback_data=f"stop:{poll_id}",
+                style="danger",
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+def build_personal_poll_keyboard(options: list, counts: dict, voted_option_id: int) -> InlineKeyboardMarkup:
+    """
+    একজন ইউজারের ব্যক্তিগত (DM) পোল-স্ন্যাপশট — শুধু সেই ইউজারই এই মেসেজটা পায়,
+    তাই এখানে তার ভোট দেওয়া অপশনটা আলাদা রঙে (সবুজ) হাইলাইট করা নিরাপদ।
+    গ্রুপের আসল পোল মেসেজে এই রঙ কেউ দেখবে না, সেটা সবার জন্য আকাশি-ই থাকবে।
+    """
+    rows = []
+    row = []
+    for option_id, option_text in options:
+        count = counts.get(option_id, 0)
+        is_mine = option_id == voted_option_id
+        style = "success" if is_mine else "primary"
+        label = f"✅ {option_text} ({count})" if is_mine else f"🔷 {option_text} ({count})" if count else f"🔷 {option_text}"
+        row.append(InlineKeyboardButton(label, callback_data="noop", style=style))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
     return InlineKeyboardMarkup(rows)
 
 
@@ -352,7 +395,14 @@ async def handle_vote(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("এই পোলটি ইতিমধ্যে বন্ধ হয়ে গেছে।", show_alert=True)
         return
 
-    db.cast_vote(poll_id, update.effective_user.id, option_id)
+    result = db.try_claim_option(poll_id, update.effective_user.id, option_id)
+
+    if result == "already_voted":
+        await query.answer(
+            "আপনি ইতিমধ্যে ভোট দিয়েছেন। একটা পোলে একবারই সুযোগ পাবেন।", show_alert=True
+        )
+        return
+
     await query.answer("✅ আপনার ভোট গৃহীত হয়েছে")
 
     option_rows = db.get_options(poll_id)
@@ -371,6 +421,51 @@ async def handle_vote(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # message not modified হলে telegram error দেয়, সেটা উপেক্ষা করা নিরাপদ
         if "not modified" not in str(e).lower():
             logger.warning("poll message update failed: %s", e)
+
+    # গ্রুপের পোল মেসেজ সবার জন্য একই আকাশি রঙেই থাকবে (Telegram একই মেসেজে
+    # ভিন্ন ভিন্ন ইউজারকে ভিন্ন বাটন-রঙ দেখানো সাপোর্ট করে না)। তাই ভোটার নিজে
+    # কোনটায় ভোট দিয়েছে সেটা রঙসহ দেখতে চাইলে তাকে আলাদাভাবে DM করা হচ্ছে।
+    try:
+        personal_markup = build_personal_poll_keyboard(option_rows, counts, option_id)
+        await context.bot.send_message(
+            chat_id=update.effective_user.id,
+            text=(
+                f"✅ আপনি \"{question}\" পোলে ভোট দিয়েছেন।\n\n"
+                "নিচে আপনার পছন্দটা সবুজ রঙে হাইলাইট করা আছে — এই রঙ শুধু আপনিই দেখছেন, "
+                "গ্রুপে সবার কাছে বাটনগুলো আকাশি-ই দেখাবে।"
+            ),
+            reply_markup=personal_markup,
+        )
+    except Exception as e:
+        # ইউজার বটকে প্রাইভেটে /start করেনি বলে DM যায়নি হয়ত — এটা এড়িয়ে যাওয়া নিরাপদ,
+        # কারণ query.answer() দিয়ে ইতিমধ্যে একটা নিশ্চিতকরণ পপ-আপ পেয়ে গেছে
+        logger.info("personal vote DM failed for user %s: %s", update.effective_user.id, e)
+
+
+async def handle_myvote(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    'আমার ভোট দেখুন' বাটন — শুধু যে চাপবে, শুধু তাকেই একটা প্রাইভেট পপ-আপে
+    জানানো হয় সে কোন অপশনে ভোট দিয়েছে। Telegram-এর alert পপ-আপে কোনো রঙ/স্টাইল
+    দেখানো যায় না (শুধু লেখা), তাই আসল রঙসহ ভোট দেখতে DM মেসেজটা কাজে লাগবে।
+    """
+    query = update.callback_query
+    poll_id = int(query.data.split(":", 1)[1])
+
+    voted_option_id = db.get_user_vote(poll_id, update.effective_user.id)
+    if voted_option_id is None:
+        await query.answer("আপনি এখনো এই পোলে ভোট দেননি।", show_alert=True)
+        return
+
+    option_rows = db.get_options(poll_id)
+    option_text = next(
+        (text for oid, text in option_rows if oid == voted_option_id), "?"
+    )
+    await query.answer(f"আপনি ভোট দিয়েছেন: {option_text}", show_alert=True)
+
+
+async def handle_noop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # ব্যক্তিগত (DM) স্ন্যাপশটের বাটনগুলো শুধু দেখানোর জন্য, চাপলে কিছু হবে না
+    await update.callback_query.answer()
 
 
 async def handle_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -475,6 +570,8 @@ def main():
     application.add_handler(conv_handler)
     application.add_handler(CallbackQueryHandler(menu_router, pattern="^menu:"))
     application.add_handler(CallbackQueryHandler(handle_vote, pattern="^vote:"))
+    application.add_handler(CallbackQueryHandler(handle_myvote, pattern="^myvote:"))
+    application.add_handler(CallbackQueryHandler(handle_noop, pattern="^noop$"))
     application.add_handler(CallbackQueryHandler(handle_stop, pattern="^stop:"))
     application.add_handler(
         ChatMemberHandler(track_chats, ChatMemberHandler.MY_CHAT_MEMBER)

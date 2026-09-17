@@ -146,18 +146,29 @@ def get_options(poll_id: int):
         ).fetchall()
 
 
-def cast_vote(poll_id: int, user_id: int, option_id: int):
-    """One vote per user per poll; voting again changes the previous vote."""
+def try_claim_option(poll_id: int, user_id: int, option_id: int) -> str:
+    """
+    একজন ইউজার একটা পোলে জীবনে একবারই ভোট দিতে পারবে (যেকোনো একটা অপশনে),
+    কিন্তু একটা অপশনে একাধিক ভিন্ন ইউজার ভোট দিতে পারবে — এটা এখন সবার জন্য
+    খোলা অপশন, শুধু একজন ইউজার দুইবার/দুইটা অপশনে ভোট দিতে পারবে না।
+    Returns: "ok" | "already_voted"
+    """
     with _lock, _connect() as conn:
-        conn.execute(
-            """
-            INSERT INTO votes (poll_id, user_id, option_id) VALUES (?, ?, ?)
-            ON CONFLICT(poll_id, user_id) DO UPDATE SET
-                option_id=excluded.option_id,
-                voted_at=CURRENT_TIMESTAMP
-            """,
-            (poll_id, user_id, option_id),
-        )
+        already = conn.execute(
+            "SELECT 1 FROM votes WHERE poll_id=? AND user_id=?", (poll_id, user_id)
+        ).fetchone()
+        if already:
+            return "already_voted"
+
+        try:
+            conn.execute(
+                "INSERT INTO votes (poll_id, user_id, option_id) VALUES (?, ?, ?)",
+                (poll_id, user_id, option_id),
+            )
+        except sqlite3.IntegrityError:
+            # দুইজন ঠিক একই মুহূর্তে চাপলে race condition — একজন ইউজার একবারই ভোট দিতে পারবে
+            return "already_voted"
+    return "ok"
 
 
 def get_vote_counts(poll_id: int) -> dict:
@@ -167,6 +178,16 @@ def get_vote_counts(poll_id: int) -> dict:
             (poll_id,),
         ).fetchall()
     return {option_id: count for option_id, count in rows}
+
+
+def get_user_vote(poll_id: int, user_id: int):
+    """একজন ইউজার এই পোলে কোন option_id-তে ভোট দিয়েছে, না দিলে None।"""
+    with _lock, _connect() as conn:
+        row = conn.execute(
+            "SELECT option_id FROM votes WHERE poll_id=? AND user_id=?",
+            (poll_id, user_id),
+        ).fetchone()
+    return row[0] if row else None
 
 
 def close_poll(poll_id: int):
