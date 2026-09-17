@@ -1,0 +1,488 @@
+"""
+bot.py — কাস্টম পোল টেলিগ্রাম বট
+----------------------------------
+বাটন দিয়ে যত খুশি কাস্টম পোল বানানো যায় (নিজের অপশনের নাম দিয়ে),
+আনলিমিটেড চ্যানেল/গ্রুপে (বট যেখানে এডমিন) পোস্ট করা যায়,
+এবং শুধু সেই চ্যানেল/গ্রুপের এডমিনরাই পোল বন্ধ করতে পারবে।
+
+চালানোর নিয়ম README.md এ বিস্তারিত আছে।
+"""
+
+import logging
+import os
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+from dotenv import load_dotenv
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
+from telegram.constants import ChatMemberStatus, ParseMode
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    ChatMemberHandler,
+    CommandHandler,
+    ContextTypes,
+    ConversationHandler,
+    MessageHandler,
+    filters,
+)
+
+import database as db
+
+load_dotenv()
+
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+DB_PATH = os.environ.get("DB_PATH", "pollbot.db")
+MAX_OPTIONS = 20
+MIN_OPTIONS = 2
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+
+# Conversation states
+CHOOSE_CHAT, ASK_QUESTION, ASK_OPTIONS = range(3)
+
+
+# ---------------------------------------------------------------------------
+# সাহায্যকারী ফাংশন
+# ---------------------------------------------------------------------------
+
+def build_poll_keyboard(poll_id: int, options: list, counts: dict) -> InlineKeyboardMarkup:
+    rows = []
+    row = []
+    for i, (option_id, option_text) in enumerate(options):
+        count = counts.get(option_id, 0)
+        label = f"📊 {count} | 💎 {option_text}"
+        row.append(InlineKeyboardButton(label, callback_data=f"vote:{poll_id}:{option_id}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append(
+        [InlineKeyboardButton("🔴 থামান এবং ফলাফল পান", callback_data=f"stop:{poll_id}")]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+def build_poll_text(question: str, total_votes: int) -> str:
+    return (
+        f"🗳 <b>{question}</b>\n\n"
+        f"📈 মোট ভোট: {total_votes}\n\n"
+        f"নিচের বাটনে চেপে আপনার পছন্দের অপশনে ভোট দিন 👇"
+    )
+
+
+def build_result_text(question: str, options: list, counts: dict) -> str:
+    total = sum(counts.values())
+    lines = [f"🔒 <b>{question}</b> — পোল বন্ধ হয়েছে\n", f"📈 মোট ভোট: {total}\n"]
+    ranked = sorted(options, key=lambda o: counts.get(o[0], 0), reverse=True)
+    medals = ["🥇", "🥈", "🥉"]
+    for idx, (option_id, option_text) in enumerate(ranked):
+        count = counts.get(option_id, 0)
+        prefix = medals[idx] if idx < 3 and count > 0 else "▫️"
+        lines.append(f"{prefix} {option_text} — {count} ভোট")
+    return "\n".join(lines)
+
+
+async def user_is_chat_admin(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int) -> bool:
+    try:
+        member = await context.bot.get_chat_member(chat_id, user_id)
+        return member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
+    except Exception as e:
+        logger.warning("admin check failed for chat %s user %s: %s", chat_id, user_id, e)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# my_chat_member — বট কোন চ্যানেল/গ্রুপে এডমিন/মেম্বার হলে/বাদ পড়লে রেজিস্টার করে
+# ---------------------------------------------------------------------------
+
+async def track_chats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    result = update.my_chat_member
+    chat = result.chat
+    new_status = result.new_chat_member.status
+    db.upsert_chat(chat.id, chat.title or chat.full_name or str(chat.id), chat.type, new_status)
+    logger.info("chat %s (%s) -> status %s", chat.id, chat.title, new_status)
+
+
+# ---------------------------------------------------------------------------
+# /start ও মূল মেনু
+# ---------------------------------------------------------------------------
+
+MAIN_MENU_KEYBOARD = InlineKeyboardMarkup(
+    [
+        [InlineKeyboardButton("📊 নতুন পোল তৈরি করুন", callback_data="menu:newpoll")],
+        [InlineKeyboardButton("📋 আমার চ্যানেল/গ্রুপ", callback_data="menu:mychats")],
+        [InlineKeyboardButton("❓ সাহায্য", callback_data="menu:help")],
+    ]
+)
+
+HELP_TEXT = (
+    "🤖 <b>পোল বট ব্যবহারের নিয়ম</b>\n\n"
+    "১. এই বটকে যেই চ্যানেল/গ্রুপে পোল বানাতে চান, সেখানে <b>এডমিন</b> হিসেবে যোগ করুন "
+    "(মেসেজ পাঠানোর পারমিশন সহ)।\n"
+    "২. বটকে /start দিয়ে চালু করুন, তারপর \"📊 নতুন পোল তৈরি করুন\" চাপুন।\n"
+    "৩. কোন চ্যানেল/গ্রুপে পোল যাবে সেটা বেছে নিন — শুধু সেই চ্যাটগুলোই দেখাবে যেখানে "
+    "আপনি নিজে এডমিন এবং বটও এডমিন।\n"
+    "৪. পোলের প্রশ্ন লিখুন, তারপর একটার পর একটা অপশনের নাম লিখুন। শেষ হলে "
+    "\"✅ শেষ করুন\" চাপুন (নূন্যতম ২টি অপশন লাগবে)।\n"
+    "৫. পোল পোস্ট হয়ে যাবে — যে কেউ বাটনে চেপে ভোট দিতে পারবে।\n"
+    "৬. শুধু ওই চ্যানেল/গ্রুপের <b>এডমিনরাই</b> \"🔴 থামান এবং ফলাফল পান\" বাটনে চেপে "
+    "পোল বন্ধ করতে পারবে ও ফলাফল দেখতে পারবে।\n\n"
+    "কমান্ড: /start /newpoll /mychats /cancel /help"
+)
+
+
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "স্বাগতম! এখান থেকে যত খুশি কাস্টম পোল বানাতে পারবেন এবং যেকোনো "
+        "চ্যানেল/গ্রুপে পোস্ট করতে পারবেন (যেখানে আপনি ও বট দুজনেই এডমিন)।",
+        reply_markup=MAIN_MENU_KEYBOARD,
+    )
+
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.HTML)
+
+
+async def mychats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await show_my_chats(update.effective_message, context, update.effective_user.id)
+
+
+async def show_my_chats(message, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    chats = db.list_active_chats()
+    admin_chats = []
+    for chat_id, title, chat_type in chats:
+        if await user_is_chat_admin(context, chat_id, user_id):
+            admin_chats.append((chat_id, title, chat_type))
+
+    if not admin_chats:
+        await message.reply_text(
+            "আপনি কোনো চ্যানেল/গ্রুপে এডমিন নন যেখানে এই বটও এডমিন আছে।\n\n"
+            "প্রথমে বটকে আপনার চ্যানেল/গ্রুপে এডমিন হিসেবে যোগ করুন, তারপর আবার চেষ্টা করুন।"
+        )
+        return
+
+    lines = ["📋 <b>আপনার চ্যানেল/গ্রুপ যেখানে পোল বানাতে পারবেন:</b>\n"]
+    for chat_id, title, chat_type in admin_chats:
+        kind = "চ্যানেল" if chat_type == "channel" else "গ্রুপ"
+        lines.append(f"• {title} ({kind})")
+    await message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    action = query.data.split(":", 1)[1]
+    if action == "help":
+        await query.message.reply_text(HELP_TEXT, parse_mode=ParseMode.HTML)
+    elif action == "mychats":
+        await show_my_chats(query.message, context, update.effective_user.id)
+    # "newpoll" টা ConversationHandler এর entry_point হিসেবে আলাদাভাবে ধরা হয়
+
+
+# ---------------------------------------------------------------------------
+# পোল তৈরির Conversation
+# ---------------------------------------------------------------------------
+
+async def newpoll_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query:
+        await query.answer()
+        message = query.message
+    else:
+        message = update.message
+
+    user_id = update.effective_user.id
+    chats = db.list_active_chats()
+    admin_chats = []
+    for chat_id, title, chat_type in chats:
+        if await user_is_chat_admin(context, chat_id, user_id):
+            admin_chats.append((chat_id, title, chat_type))
+
+    if not admin_chats:
+        await message.reply_text(
+            "আপনি কোনো চ্যানেল/গ্রুপে এডমিন নন যেখানে এই বটও এডমিন আছে।\n\n"
+            "প্রথমে বটকে আপনার চ্যানেল/গ্রুপে এডমিন হিসেবে যোগ করে আবার /newpoll দিন।"
+        )
+        return ConversationHandler.END
+
+    buttons = [
+        [InlineKeyboardButton(title, callback_data=f"chat:{chat_id}")]
+        for chat_id, title, chat_type in admin_chats
+    ]
+    buttons.append([InlineKeyboardButton("❌ বাতিল", callback_data="cancel")])
+    await message.reply_text(
+        "কোন চ্যানেল/গ্রুপে পোল পোস্ট করতে চান?",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+    return CHOOSE_CHAT
+
+
+async def choose_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data == "cancel":
+        await query.message.reply_text("বাতিল করা হয়েছে।")
+        return ConversationHandler.END
+
+    chat_id = int(query.data.split(":", 1)[1])
+    context.user_data["target_chat_id"] = chat_id
+    await query.message.reply_text(
+        "✏️ পোলের প্রশ্ন / টাইটেল লিখুন:",
+    )
+    return ASK_QUESTION
+
+
+async def ask_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["question"] = update.message.text.strip()
+    context.user_data["options"] = []
+    await update.message.reply_text(
+        "এবার একটা একটা করে অপশনের নাম লিখে পাঠান (যেমন: PHP Prottay, Mehedi, ADI FF...)।\n"
+        "নূন্যতম ২টা অপশন দিতে হবে। শেষ হলে নিচের বাটনে চাপুন।",
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("✅ শেষ করুন", callback_data="options_done")],
+                [InlineKeyboardButton("❌ বাতিল", callback_data="cancel")],
+            ]
+        ),
+    )
+    return ASK_OPTIONS
+
+
+async def add_option(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    options = context.user_data.setdefault("options", [])
+    if len(options) >= MAX_OPTIONS:
+        await update.message.reply_text(
+            f"সর্বোচ্চ {MAX_OPTIONS}টি অপশন দেওয়া যাবে। এখন \"✅ শেষ করুন\" চাপুন।"
+        )
+        return ASK_OPTIONS
+
+    text = update.message.text.strip()
+    if text:
+        options.append(text)
+
+    await update.message.reply_text(
+        f"যোগ হয়েছে: {text}\n\nমোট অপশন: {len(options)}\n\n"
+        "আরও অপশন লিখুন, অথবা শেষ হলে নিচের বাটনে চাপুন।",
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("✅ শেষ করুন", callback_data="options_done")],
+                [InlineKeyboardButton("❌ বাতিল", callback_data="cancel")],
+            ]
+        ),
+    )
+    return ASK_OPTIONS
+
+
+async def finish_options(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "cancel":
+        await query.message.reply_text("বাতিল করা হয়েছে।")
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    options = context.user_data.get("options", [])
+    if len(options) < MIN_OPTIONS:
+        await query.message.reply_text(
+            f"নূন্যতম {MIN_OPTIONS}টি অপশন লাগবে। আরও অপশন লিখুন।"
+        )
+        return ASK_OPTIONS
+
+    chat_id = context.user_data["target_chat_id"]
+    question = context.user_data["question"]
+    creator_id = update.effective_user.id
+
+    poll_id = db.create_poll(chat_id, question, creator_id, options)
+    option_rows = db.get_options(poll_id)  # [(option_id, text), ...]
+    counts = db.get_vote_counts(poll_id)
+
+    text = build_poll_text(question, 0)
+    markup = build_poll_keyboard(poll_id, option_rows, counts)
+
+    try:
+        sent = await context.bot.send_message(
+            chat_id=chat_id, text=text, reply_markup=markup, parse_mode=ParseMode.HTML
+        )
+        db.set_poll_message(poll_id, sent.message_id)
+        await query.message.reply_text("✅ পোল সফলভাবে পোস্ট হয়েছে!")
+    except Exception as e:
+        logger.exception("poll পোস্ট করতে ব্যর্থ")
+        await query.message.reply_text(
+            f"❌ পোল পোস্ট করা যায়নি: {e}\n\nবট ওই চ্যাটে মেসেজ পাঠানোর পারমিশনসহ "
+            "এডমিন কিনা যাচাই করুন।"
+        )
+
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def cancel_conv(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text("বাতিল করা হয়েছে।")
+    return ConversationHandler.END
+
+
+# ---------------------------------------------------------------------------
+# ভোট দেওয়া ও পোল বন্ধ করা (callback_query — যেকোনো চ্যাটে কাজ করে)
+# ---------------------------------------------------------------------------
+
+async def handle_vote(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    _, poll_id_str, option_id_str = query.data.split(":")
+    poll_id, option_id = int(poll_id_str), int(option_id_str)
+
+    poll = db.get_poll(poll_id)
+    if not poll:
+        await query.answer("এই পোলটি পাওয়া যায়নি।", show_alert=True)
+        return
+    _, chat_id, message_id, question, creator_id, status = poll
+
+    if status != "open":
+        await query.answer("এই পোলটি ইতিমধ্যে বন্ধ হয়ে গেছে।", show_alert=True)
+        return
+
+    db.cast_vote(poll_id, update.effective_user.id, option_id)
+    await query.answer("✅ আপনার ভোট গৃহীত হয়েছে")
+
+    option_rows = db.get_options(poll_id)
+    counts = db.get_vote_counts(poll_id)
+    total = sum(counts.values())
+
+    try:
+        await context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=build_poll_text(question, total),
+            reply_markup=build_poll_keyboard(poll_id, option_rows, counts),
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as e:
+        # message not modified হলে telegram error দেয়, সেটা উপেক্ষা করা নিরাপদ
+        if "not modified" not in str(e).lower():
+            logger.warning("poll message update failed: %s", e)
+
+
+async def handle_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    poll_id = int(query.data.split(":", 1)[1])
+
+    poll = db.get_poll(poll_id)
+    if not poll:
+        await query.answer("এই পোলটি পাওয়া যায়নি।", show_alert=True)
+        return
+    _, chat_id, message_id, question, creator_id, status = poll
+
+    user_id = update.effective_user.id
+    is_admin = await user_is_chat_admin(context, chat_id, user_id)
+    if not (is_admin or user_id == creator_id):
+        await query.answer(
+            "শুধুমাত্র এই চ্যানেল/গ্রুপের এডমিন পোল বন্ধ করতে পারবেন।", show_alert=True
+        )
+        return
+
+    if status != "open":
+        await query.answer("পোলটি আগেই বন্ধ হয়ে গেছে।")
+        return
+
+    db.close_poll(poll_id)
+    option_rows = db.get_options(poll_id)
+    counts = db.get_vote_counts(poll_id)
+
+    await query.answer("🔒 পোল বন্ধ করা হয়েছে")
+    try:
+        await context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=build_result_text(question, option_rows, counts),
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as e:
+        logger.warning("poll close-edit failed: %s", e)
+
+
+# ---------------------------------------------------------------------------
+# Health-check সার্ভার — শুধুমাত্র Render/Railway-এর মতো হোস্টের জন্য।
+# এই বট আসলে HTTP সার্ভ করে না (Telegram-এর সাথে long-polling করে), কিন্তু
+# Render-এর ফ্রি "Web Service" টাইপ কিছু একটা পোর্টে সাড়া না পেলে ডিপ্লয়মেন্ট
+# ব্যর্থ ধরে নেয়। তাই একটা আলাদা থ্রেডে সামান্য "OK" রেসপন্স দেওয়ার সার্ভার
+# চালানো হচ্ছে — এটা বটের মূল লজিকের সাথে সম্পর্কহীন।
+# ---------------------------------------------------------------------------
+
+class _HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write("Poll bot is running \u2705".encode("utf-8"))
+
+    def log_message(self, format, *args):
+        pass  # health-check হিটে টার্মিনাল স্প্যাম বন্ধ রাখার জন্য
+
+
+def start_health_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), _HealthCheckHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    logger.info("health-check সার্ভার চালু হয়েছে পোর্ট %s এ", port)
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
+def main():
+    if not BOT_TOKEN:
+        raise SystemExit(
+            "BOT_TOKEN পাওয়া যায়নি। .env ফাইলে BOT_TOKEN=xxxx বসিয়ে আবার চালান।"
+        )
+
+    start_health_server()
+    db.init_db(DB_PATH)
+
+    application = Application.builder().token(BOT_TOKEN).build()
+
+    conv_handler = ConversationHandler(
+        entry_points=[
+            CommandHandler("newpoll", newpoll_entry),
+            CallbackQueryHandler(newpoll_entry, pattern="^menu:newpoll$"),
+        ],
+        states={
+            CHOOSE_CHAT: [CallbackQueryHandler(choose_chat)],
+            ASK_QUESTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_question)],
+            ASK_OPTIONS: [
+                CallbackQueryHandler(finish_options, pattern="^(options_done|cancel)$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_option),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_conv)],
+    )
+
+    application.add_handler(CommandHandler("start", start_cmd))
+    application.add_handler(CommandHandler("help", help_cmd))
+    application.add_handler(CommandHandler("mychats", mychats_cmd))
+    application.add_handler(conv_handler)
+    application.add_handler(CallbackQueryHandler(menu_router, pattern="^menu:"))
+    application.add_handler(CallbackQueryHandler(handle_vote, pattern="^vote:"))
+    application.add_handler(CallbackQueryHandler(handle_stop, pattern="^stop:"))
+    application.add_handler(
+        ChatMemberHandler(track_chats, ChatMemberHandler.MY_CHAT_MEMBER)
+    )
+
+    logger.info("বট চালু হচ্ছে...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()
