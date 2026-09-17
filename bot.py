@@ -10,6 +10,7 @@ bot.py — কাস্টম পোল টেলিগ্রাম বট
 
 import logging
 import os
+import re
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -17,6 +18,7 @@ from dotenv import load_dotenv
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
     Update,
 )
 from telegram.constants import ChatMemberStatus, ParseMode
@@ -157,22 +159,30 @@ async def track_chats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
-# /start ও মূল মেনু
+# /start ও মূল মেনু — এখন এটা চ্যাটের নিচে সবসময় থাকা একটা মেনু (বড় বড় বটের মতো),
+# ইনলাইন বাটনের বদলে টেক্সট-কিবোর্ড (ReplyKeyboardMarkup) ব্যবহার করা হচ্ছে
 # ---------------------------------------------------------------------------
 
-MAIN_MENU_KEYBOARD = InlineKeyboardMarkup(
+MENU_NEWPOLL_TEXT = "📊 নতুন পোল তৈরি করুন"
+MENU_MYCHATS_TEXT = "📋 আমার চ্যানেল/গ্রুপ"
+MENU_HELP_TEXT = "❓ সাহায্য"
+
+_menu_filter = lambda text: filters.Regex(f"^{re.escape(text)}$")
+
+MAIN_MENU_REPLY_KEYBOARD = ReplyKeyboardMarkup(
     [
-        [InlineKeyboardButton("📊 নতুন পোল তৈরি করুন", callback_data="menu:newpoll")],
-        [InlineKeyboardButton("📋 আমার চ্যানেল/গ্রুপ", callback_data="menu:mychats")],
-        [InlineKeyboardButton("❓ সাহায্য", callback_data="menu:help")],
-    ]
+        [MENU_NEWPOLL_TEXT],
+        [MENU_MYCHATS_TEXT, MENU_HELP_TEXT],
+    ],
+    resize_keyboard=True,       # বাটনগুলো ছোট/ফিট হয়ে থাকবে
+    is_persistent=True,         # চ্যাট থেকে কিবোর্ড আইকনে ক্লিক না করেও সবসময় দেখা যাবে
 )
 
 HELP_TEXT = (
     "🤖 <b>পোল বট ব্যবহারের নিয়ম</b>\n\n"
     "১. এই বটকে যেই চ্যানেল/গ্রুপে পোল বানাতে চান, সেখানে <b>এডমিন</b> হিসেবে যোগ করুন "
     "(মেসেজ পাঠানোর পারমিশন সহ)।\n"
-    "২. বটকে /start দিয়ে চালু করুন, তারপর \"📊 নতুন পোল তৈরি করুন\" চাপুন।\n"
+    "২. নিচের মেনু থেকে \"📊 নতুন পোল তৈরি করুন\" চাপুন।\n"
     "৩. কোন চ্যানেল/গ্রুপে পোল যাবে সেটা বেছে নিন — শুধু সেই চ্যাটগুলোই দেখাবে যেখানে "
     "আপনি নিজে এডমিন এবং বটও এডমিন।\n"
     "৪. পোলের প্রশ্ন লিখুন, তারপর একটার পর একটা অপশনের নাম লিখুন। শেষ হলে "
@@ -180,15 +190,17 @@ HELP_TEXT = (
     "৫. পোল পোস্ট হয়ে যাবে — যে কেউ বাটনে চেপে ভোট দিতে পারবে।\n"
     "৬. শুধু ওই চ্যানেল/গ্রুপের <b>এডমিনরাই</b> \"🔴 থামান এবং ফলাফল পান\" বাটনে চেপে "
     "পোল বন্ধ করতে পারবে ও ফলাফল দেখতে পারবে।\n\n"
-    "কমান্ড: /start /newpoll /mychats /cancel /help"
+    "কমান্ড: /start /newpoll /mychats /cancel /help\n"
+    "অথবা নিচের মেনু থেকে সরাসরি বেছে নিন 👇"
 )
 
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "স্বাগতম! এখান থেকে যত খুশি কাস্টম পোল বানাতে পারবেন এবং যেকোনো "
-        "চ্যানেল/গ্রুপে পোস্ট করতে পারবেন (যেখানে আপনি ও বট দুজনেই এডমিন)।",
-        reply_markup=MAIN_MENU_KEYBOARD,
+        "চ্যানেল/গ্রুপে পোস্ট করতে পারবেন (যেখানে আপনি ও বট দুজনেই এডমিন)।\n\n"
+        "নিচে মেনু থেকে যা করতে চান বেছে নিন 👇",
+        reply_markup=MAIN_MENU_REPLY_KEYBOARD,
     )
 
 
@@ -219,17 +231,6 @@ async def show_my_chats(message, context: ContextTypes.DEFAULT_TYPE, user_id: in
         kind = "চ্যানেল" if chat_type == "channel" else "গ্রুপ"
         lines.append(f"• {title} ({kind})")
     await message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
-
-
-async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    action = query.data.split(":", 1)[1]
-    if action == "help":
-        await query.message.reply_text(HELP_TEXT, parse_mode=ParseMode.HTML)
-    elif action == "mychats":
-        await show_my_chats(query.message, context, update.effective_user.id)
-    # "newpoll" টা ConversationHandler এর entry_point হিসেবে আলাদাভাবে ধরা হয়
 
 
 # ---------------------------------------------------------------------------
@@ -551,7 +552,7 @@ def main():
     conv_handler = ConversationHandler(
         entry_points=[
             CommandHandler("newpoll", newpoll_entry),
-            CallbackQueryHandler(newpoll_entry, pattern="^menu:newpoll$"),
+            MessageHandler(_menu_filter(MENU_NEWPOLL_TEXT), newpoll_entry),
         ],
         states={
             CHOOSE_CHAT: [CallbackQueryHandler(choose_chat)],
@@ -568,7 +569,10 @@ def main():
     application.add_handler(CommandHandler("help", help_cmd))
     application.add_handler(CommandHandler("mychats", mychats_cmd))
     application.add_handler(conv_handler)
-    application.add_handler(CallbackQueryHandler(menu_router, pattern="^menu:"))
+    # নিচের মেনু-বাটনের টেক্সট মেসেজগুলো ধরার হ্যান্ডলার (conv_handler এর পরে, যাতে
+    # /newpoll চলাকালীন প্রশ্ন/অপশন টাইপ করার সময় এগুলো বাধা না দেয়)
+    application.add_handler(MessageHandler(_menu_filter(MENU_MYCHATS_TEXT), mychats_cmd))
+    application.add_handler(MessageHandler(_menu_filter(MENU_HELP_TEXT), help_cmd))
     application.add_handler(CallbackQueryHandler(handle_vote, pattern="^vote:"))
     application.add_handler(CallbackQueryHandler(handle_myvote, pattern="^myvote:"))
     application.add_handler(CallbackQueryHandler(handle_noop, pattern="^noop$"))
