@@ -3,7 +3,8 @@ bot.py — কাস্টম পোল টেলিগ্রাম বট
 ----------------------------------
 বাটন দিয়ে যত খুশি কাস্টম পোল বানানো যায় (নিজের অপশনের নাম দিয়ে),
 আনলিমিটেড চ্যানেল/গ্রুপে (বট যেখানে এডমিন) পোস্ট করা যায়,
-এবং শুধু সেই চ্যানেল/গ্রুপের এডমিনরাই পোল বন্ধ করতে পারবে।
+এবং শুধু সেই চ্যানেল/গ্রুপের এডমিনরাই পোল বন্ধ করতে পারবে (কনফার্মেশনসহ)
+এবং পোল এডিট করতে পারবে (নতুন অপশন/প্রি-সেট ভোট যোগ, কাউকে ভোট থেকে বাদ দেওয়া)।
 
 চালানোর নিয়ম README.md এ বিস্তারিত আছে।
 """
@@ -48,7 +49,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Conversation states
+# Conversation states (পোল তৈরির জন্য)
 CHOOSE_CHAT, ASK_QUESTION, ASK_OPTIONS = range(3)
 
 
@@ -86,8 +87,16 @@ def build_poll_keyboard(poll_id: int, options: list, counts: dict) -> InlineKeyb
     rows.append(
         [
             InlineKeyboardButton(
+                "✏️ পোল এডিট করুন (এডমিন)",
+                callback_data=f"editmenu:{poll_id}",
+            )
+        ]
+    )
+    rows.append(
+        [
+            InlineKeyboardButton(
                 "🔴 থামান এবং ফলাফল পান",
-                callback_data=f"stop:{poll_id}",
+                callback_data=f"stopask:{poll_id}",
                 style="danger",
             )
         ]
@@ -162,6 +171,33 @@ async def user_is_chat_member(context: ContextTypes.DEFAULT_TYPE, chat_id: int, 
     return member.status not in NOT_MEMBER_STATUSES
 
 
+async def refresh_poll_message(context: ContextTypes.DEFAULT_TYPE, poll_id: int):
+    """
+    পোলের আসল মেসেজটা (গ্রুপ/চ্যানেলে থাকা) সবশেষ অপশন+কাউন্ট দিয়ে আপডেট করে।
+    নতুন অপশন যোগ করা, কাউকে ভোট থেকে বাদ দেওয়া — দুই ক্ষেত্রেই এটা কল হয়।
+    """
+    poll = db.get_poll(poll_id)
+    if not poll:
+        return
+    _, chat_id, message_id, question, creator_id, status = poll
+    if status != "open" or not message_id:
+        return
+    option_rows = db.get_options(poll_id)
+    counts = db.get_vote_counts(poll_id)
+    total = sum(counts.values())
+    try:
+        await context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=build_poll_text(question, total),
+            reply_markup=build_poll_keyboard(poll_id, option_rows, counts),
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as e:
+        if "not modified" not in str(e).lower():
+            logger.warning("poll message refresh failed: %s", e)
+
+
 # ---------------------------------------------------------------------------
 # my_chat_member — বট কোন চ্যানেল/গ্রুপে এডমিন/মেম্বার হলে/বাদ পড়লে রেজিস্টার করে
 # ---------------------------------------------------------------------------
@@ -205,20 +241,7 @@ async def track_chat_members(update: Update, context: ContextTypes.DEFAULT_TYPE)
         logger.info(
             "user %s left chat %s -> vote removed from poll %s", user.id, chat_id, poll_id
         )
-        option_rows = db.get_options(poll_id)
-        counts = db.get_vote_counts(poll_id)
-        total = sum(counts.values())
-        try:
-            await context.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=message_id,
-                text=build_poll_text(question, total),
-                reply_markup=build_poll_keyboard(poll_id, option_rows, counts),
-                parse_mode=ParseMode.HTML,
-            )
-        except Exception as e:
-            if "not modified" not in str(e).lower():
-                logger.warning("leave-vote-removal edit failed: %s", e)
+        await refresh_poll_message(context, poll_id)
 
 
 # ---------------------------------------------------------------------------
@@ -252,7 +275,12 @@ HELP_TEXT = (
     "\"✅ শেষ করুন\" চাপুন (নূন্যতম ২টি অপশন লাগবে)।\n"
     "৫. পোল পোস্ট হয়ে যাবে — যে কেউ বাটনে চেপে ভোট দিতে পারবে।\n"
     "৬. শুধু ওই চ্যানেল/গ্রুপের <b>এডমিনরাই</b> \"🔴 থামান এবং ফলাফল পান\" বাটনে চেপে "
-    "পোল বন্ধ করতে পারবে ও ফলাফল দেখতে পারবে।\n\n"
+    "(একটা কনফার্মেশনের পর) পোল বন্ধ করতে পারবে ও ফলাফল দেখতে পারবে।\n"
+    "৭. শুধু <b>এডমিনরাই</b> \"✏️ পোল এডিট করুন\" বাটন থেকে —\n"
+    "   • নতুন অপশন যোগ করতে পারবেন। শুধু নাম লিখলে ০ ভোট দিয়ে শুরু হবে, আর "
+    "<code>নাম,সংখ্যা</code> এভাবে লিখলে (যেমন <code>Mehedi,10</code>) সেই অপশন ওই "
+    "সংখ্যা ভোট নিয়ে শুরু হবে এবং তারপর থেকে আসল ভোট যোগ হতে থাকবে।\n"
+    "   • কাউকে ভোট থেকে বাদ দিতে (তার ভোট বাতিল করতে) পারবেন।\n\n"
     "🛡 <b>ফেক ভোট প্রতিরোধ:</b>\n"
     "• যে চ্যানেল/গ্রুপে পোল পোস্ট হয়েছে, সেখানে জয়েন করা না থাকলে ভোট দেওয়া যাবে না।\n"
     "• ভোট দেওয়ার পর কেউ চ্যানেল/গ্রুপ ছেড়ে গেলে তার ভোট অটোমেটিক মুছে যাবে ও লাইভ "
@@ -447,8 +475,19 @@ async def cancel_conv(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+async def cancel_cmd_generic(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /cancel — যখন কোনো ConversationHandler-এর ভেতরে না থেকেও (যেমন 'নতুন অপশন
+    যোগ করুন' এর টেক্সট আসার অপেক্ষায় থাকা অবস্থায়) কেউ বাতিল করতে চায়।
+    """
+    if context.user_data.pop("awaiting", None) is not None:
+        await update.message.reply_text("বাতিল করা হয়েছে।")
+    # ConversationHandler-এর ভেতরে থাকলে সেটার নিজের /cancel fallback আগেই ধরে ফেলবে,
+    # তাই এখানে আর কিছু বলার দরকার নেই যদি awaiting-ও না থাকে।
+
+
 # ---------------------------------------------------------------------------
-# ভোট দেওয়া ও পোল বন্ধ করা (callback_query — যেকোনো চ্যাটে কাজ করে)
+# ভোট দেওয়া (callback_query — যেকোনো চ্যাটে কাজ করে)
 # ---------------------------------------------------------------------------
 
 async def handle_vote(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -487,7 +526,8 @@ async def handle_vote(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    result = db.try_claim_option(poll_id, voter.id, option_id)
+    voter_name = voter.full_name or (f"@{voter.username}" if voter.username else str(voter.id))
+    result = db.try_claim_option(poll_id, voter.id, option_id, voter_name)
 
     if result == "already_voted":
         await query.answer(
@@ -560,7 +600,12 @@ async def handle_noop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
 
 
-async def handle_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ---------------------------------------------------------------------------
+# পোল বন্ধ করা — এখন শুধুমাত্র চ্যাট-এডমিনরাই পারবে (আগে পোল-তৈরিকারীও পারতো,
+# সেই বাগ ফিক্স করা হয়েছে), এবং বন্ধ করার আগে একটা কনফার্মেশন ধাপ থাকবে।
+# ---------------------------------------------------------------------------
+
+async def handle_stopask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     poll_id = int(query.data.split(":", 1)[1])
 
@@ -572,9 +617,9 @@ async def handle_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_id = update.effective_user.id
     is_admin = await user_is_chat_admin(context, chat_id, user_id)
-    if not (is_admin or user_id == creator_id):
+    if not is_admin:
         await query.answer(
-            "শুধুমাত্র এই চ্যানেল/গ্রুপের এডমিন পোল বন্ধ করতে পারবেন।", show_alert=True
+            "শুধুমাত্র এই চ্যানেল/গ্রুপের এডমিনরাই পোল বন্ধ করতে পারবেন।", show_alert=True
         )
         return
 
@@ -582,20 +627,273 @@ async def handle_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("পোলটি আগেই বন্ধ হয়ে গেছে।")
         return
 
-    db.close_poll(poll_id)
-    option_rows = db.get_options(poll_id)
-    counts = db.get_vote_counts(poll_id)
+    await query.answer()
+    await query.message.reply_text(
+        f"⚠️ আপনি কি নিশ্চিত \"{question}\" পোলটি বন্ধ করে দিতে চান?\n"
+        "বন্ধ করার পর আর কেউ ভোট দিতে পারবে না।",
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("✅ হ্যাঁ, বন্ধ করুন", callback_data=f"stopyes:{poll_id}", style="danger"),
+                    InlineKeyboardButton("❌ না, থাক", callback_data="stopno"),
+                ]
+            ]
+        ),
+    )
 
-    await query.answer("🔒 পোল বন্ধ করা হয়েছে")
-    try:
-        await context.bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=message_id,
-            text=build_result_text(question, option_rows, counts),
-            parse_mode=ParseMode.HTML,
+
+async def handle_stopyes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    poll_id = int(query.data.split(":", 1)[1])
+
+    poll = db.get_poll(poll_id)
+    if not poll:
+        await query.answer("এই পোলটি পাওয়া যায়নি।", show_alert=True)
+        return
+    _, chat_id, message_id, question, creator_id, status = poll
+
+    user_id = update.effective_user.id
+    is_admin = await user_is_chat_admin(context, chat_id, user_id)
+    if not is_admin:
+        await query.answer(
+            "শুধুমাত্র এই চ্যানেল/গ্রুপের এডমিনরাই পোল বন্ধ করতে পারবেন।", show_alert=True
         )
-    except Exception as e:
-        logger.warning("poll close-edit failed: %s", e)
+        return
+
+    if status != "open":
+        await query.answer("পোলটি আগেই বন্ধ হয়ে গেছে।")
+    else:
+        db.close_poll(poll_id)
+        option_rows = db.get_options(poll_id)
+        counts = db.get_vote_counts(poll_id)
+        await query.answer("🔒 পোল বন্ধ করা হয়েছে")
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=build_result_text(question, option_rows, counts),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as e:
+            logger.warning("poll close-edit failed: %s", e)
+
+    # কনফার্মেশনের মেসেজটা মুছে দেওয়া হচ্ছে যাতে চ্যাট পরিষ্কার থাকে
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+
+
+async def handle_stopno(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer("বাতিল করা হয়েছে")
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# পোল এডিট করা (শুধু এডমিন) — নতুন অপশন যোগ (প্রি-সেট ভোট সহ) ও কাউকে ভোট
+# থেকে বাদ দেওয়া
+# ---------------------------------------------------------------------------
+
+async def handle_editmenu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    poll_id = int(query.data.split(":", 1)[1])
+
+    poll = db.get_poll(poll_id)
+    if not poll:
+        await query.answer("এই পোলটি পাওয়া যায়নি।", show_alert=True)
+        return
+    _, chat_id, message_id, question, creator_id, status = poll
+
+    is_admin = await user_is_chat_admin(context, chat_id, update.effective_user.id)
+    if not is_admin:
+        await query.answer(
+            "শুধুমাত্র এই চ্যানেল/গ্রুপের এডমিনরাই পোল এডিট করতে পারবেন।", show_alert=True
+        )
+        return
+
+    if status != "open":
+        await query.answer("বন্ধ হয়ে যাওয়া পোল এডিট করা যাবে না।", show_alert=True)
+        return
+
+    await query.answer()
+    await query.message.reply_text(
+        f"✏️ \"{question}\" — এডিট মেনু। কী করতে চান?",
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("➕ নতুন অপশন যোগ করুন", callback_data=f"addopt:{poll_id}")],
+                [InlineKeyboardButton("🚫 কাউকে ভোট থেকে বাদ দিন", callback_data=f"kickmenu:{poll_id}")],
+                [InlineKeyboardButton("❌ বন্ধ করুন", callback_data="editclose")],
+            ]
+        ),
+    )
+
+
+async def handle_addopt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    poll_id = int(query.data.split(":", 1)[1])
+
+    poll = db.get_poll(poll_id)
+    if not poll:
+        await query.answer("এই পোলটি পাওয়া যায়নি।", show_alert=True)
+        return
+    _, chat_id, message_id, question, creator_id, status = poll
+
+    is_admin = await user_is_chat_admin(context, chat_id, update.effective_user.id)
+    if not is_admin:
+        await query.answer(
+            "শুধুমাত্র এই চ্যানেল/গ্রুপের এডমিনরাই এই কাজ করতে পারবেন।", show_alert=True
+        )
+        return
+    if status != "open":
+        await query.answer("বন্ধ হয়ে যাওয়া পোল এডিট করা যাবে না।", show_alert=True)
+        return
+
+    context.user_data["awaiting"] = {"action": "add_option", "poll_id": poll_id}
+    await query.answer()
+    await query.message.reply_text(
+        "নতুন অপশনের নাম লিখে পাঠান।\n\n"
+        "শুধু নাম লিখলে সেটা ০ ভোট নিয়ে শুরু হবে।\n"
+        "আগে থেকেই একটা ভোট সংখ্যা বসিয়ে দিতে চাইলে এভাবে লিখুন:\n"
+        "<code>নাম,সংখ্যা</code>  (যেমন: <code>Mehedi,10</code>)\n"
+        "এতে অপশনটা ১০ ভোট নিয়ে শুরু হবে এবং তারপর থেকে আসল ভোট এর সাথে যোগ হতে থাকবে।\n\n"
+        "বাতিল করতে /cancel লিখুন।",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def handle_awaiting_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    'নতুন অপশন যোগ করুন' চাপার পর এডমিনের পরের টেক্সট মেসেজ এখানে ধরা হয়।
+    ConversationHandler ব্যবহার না করে user_data-তে সাধারণ একটা "awaiting"
+    ফ্ল্যাগ দিয়ে করা, যাতে গ্রুপ চ্যাটেই সরাসরি লেখা যায়।
+    """
+    awaiting = context.user_data.get("awaiting")
+    if not awaiting or awaiting.get("action") != "add_option":
+        return  # অন্য কোনো সাধারণ মেসেজ, এখানে কিছু করার নেই
+
+    poll_id = awaiting["poll_id"]
+    poll = db.get_poll(poll_id)
+    if not poll or poll[5] != "open":
+        context.user_data.pop("awaiting", None)
+        await update.message.reply_text("এই পোলটি আর খোলা নেই, অপশন যোগ করা গেল না।")
+        return
+
+    raw_text = update.message.text.strip()
+    if "," in raw_text:
+        name_part, count_part = raw_text.rsplit(",", 1)
+        name_part = name_part.strip()
+        count_part = count_part.strip()
+        if not count_part.isdigit():
+            await update.message.reply_text(
+                "❌ সংখ্যাটা বুঝা যায়নি। এভাবে লিখুন: নাম,সংখ্যা (যেমন Mehedi,10), "
+                "অথবা শুধু নাম লিখুন। আবার চেষ্টা করুন, বা /cancel দিন।"
+            )
+            return
+        manual_votes = int(count_part)
+        option_name = name_part
+    else:
+        option_name = raw_text
+        manual_votes = 0
+
+    if not option_name:
+        await update.message.reply_text("অপশনের নাম খালি রাখা যাবে না। আবার লিখুন, বা /cancel দিন।")
+        return
+
+    db.add_option(poll_id, option_name, manual_votes)
+    context.user_data.pop("awaiting", None)
+
+    if manual_votes:
+        await update.message.reply_text(
+            f"✅ নতুন অপশন \"{option_name}\" যোগ হয়েছে, শুরুতে {manual_votes} ভোট নিয়ে।"
+        )
+    else:
+        await update.message.reply_text(f"✅ নতুন অপশন \"{option_name}\" যোগ হয়েছে।")
+
+    await refresh_poll_message(context, poll_id)
+
+
+async def handle_kickmenu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    poll_id = int(query.data.split(":", 1)[1])
+
+    poll = db.get_poll(poll_id)
+    if not poll:
+        await query.answer("এই পোলটি পাওয়া যায়নি।", show_alert=True)
+        return
+    _, chat_id, message_id, question, creator_id, status = poll
+
+    is_admin = await user_is_chat_admin(context, chat_id, update.effective_user.id)
+    if not is_admin:
+        await query.answer(
+            "শুধুমাত্র এই চ্যানেল/গ্রুপের এডমিনরাই এই কাজ করতে পারবেন।", show_alert=True
+        )
+        return
+
+    voters = db.list_voters(poll_id)
+    await query.answer()
+    if not voters:
+        await query.message.reply_text("এখনো কেউ (আসল ভোট দিয়ে) ভোট দেয়নি।")
+        return
+
+    rows = []
+    for user_id, voter_name, option_id, option_text in voters:
+        display = voter_name or str(user_id)
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"❌ {display} — {option_text}",
+                    callback_data=f"kick:{poll_id}:{user_id}",
+                )
+            ]
+        )
+    rows.append([InlineKeyboardButton("🔙 বাতিল", callback_data="editclose")])
+    await query.message.reply_text(
+        "কাকে ভোট থেকে বাদ দিতে চান? (তার ভোট বাতিল হয়ে যাবে)",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+async def handle_kick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    _, poll_id_str, target_user_id_str = query.data.split(":")
+    poll_id, target_user_id = int(poll_id_str), int(target_user_id_str)
+
+    poll = db.get_poll(poll_id)
+    if not poll:
+        await query.answer("এই পোলটি পাওয়া যায়নি।", show_alert=True)
+        return
+    _, chat_id, message_id, question, creator_id, status = poll
+
+    is_admin = await user_is_chat_admin(context, chat_id, update.effective_user.id)
+    if not is_admin:
+        await query.answer(
+            "শুধুমাত্র এই চ্যানেল/গ্রুপের এডমিনরাই এই কাজ করতে পারবেন।", show_alert=True
+        )
+        return
+
+    removed = db.delete_vote(poll_id, target_user_id)
+    if removed:
+        await query.answer("✅ ভোট বাতিল করা হয়েছে")
+        await refresh_poll_message(context, poll_id)
+        try:
+            await query.message.edit_text("✅ ওই ইউজারের ভোট বাদ দেওয়া হয়েছে।")
+        except Exception:
+            pass
+    else:
+        await query.answer("এই ইউজারের ভোট আর খুঁজে পাওয়া যায়নি (হয়তো আগেই বাদ পড়েছে)।", show_alert=True)
+
+
+async def handle_editclose(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -604,6 +902,13 @@ async def handle_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Render-এর ফ্রি "Web Service" টাইপ কিছু একটা পোর্টে সাড়া না পেলে ডিপ্লয়মেন্ট
 # ব্যর্থ ধরে নেয়। তাই একটা আলাদা থ্রেডে সামান্য "OK" রেসপন্স দেওয়ার সার্ভার
 # চালানো হচ্ছে — এটা বটের মূল লজিকের সাথে সম্পর্কহীন।
+#
+# ⚠️ মনে রাখার ব্যাপারে: পোলের সব তথ্য (অপশন, ম্যানুয়াল ভোট, কে কোথায় ভোট
+# দিয়েছে) pollbot.db নামের SQLite ফাইলে সেভ হয় (DB_PATH এনভায়রনমেন্ট ভ্যারিয়েবল
+# দিয়ে পাল্টানো যায়)। Render/Railway এর ফ্রি প্ল্যানে এই ফাইলটা persistent disk
+# ছাড়া প্রতি রিডিপ্লয়ে মুছে যেতে পারে — বট যেন সবকিছু স্থায়ীভাবে মনে রাখে,
+# সেজন্য হোস্টে একটা persistent disk/volume মাউন্ট করে DB_PATH সেই পাথে সেট
+# করে দেওয়া দরকার।
 # ---------------------------------------------------------------------------
 
 class _HealthCheckHandler(BaseHTTPRequestHandler):
@@ -664,10 +969,23 @@ def main():
     # /newpoll চলাকালীন প্রশ্ন/অপশন টাইপ করার সময় এগুলো বাধা না দেয়)
     application.add_handler(MessageHandler(_menu_filter(MENU_MYCHATS_TEXT), mychats_cmd))
     application.add_handler(MessageHandler(_menu_filter(MENU_HELP_TEXT), help_cmd))
+
+    # পোল এডিট ফিচারের জন্য "পরের টেক্সট মেসেজের অপেক্ষা" হ্যান্ডলার এবং /cancel —
+    # conv_handler ও উপরের মেনু-হ্যান্ডলারগুলোর পরে, যাতে ওগুলোর সাথে সংঘর্ষ না হয়
+    application.add_handler(CommandHandler("cancel", cancel_cmd_generic))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_awaiting_text))
+
     application.add_handler(CallbackQueryHandler(handle_vote, pattern="^vote:"))
     application.add_handler(CallbackQueryHandler(handle_myvote, pattern="^myvote:"))
     application.add_handler(CallbackQueryHandler(handle_noop, pattern="^noop$"))
-    application.add_handler(CallbackQueryHandler(handle_stop, pattern="^stop:"))
+    application.add_handler(CallbackQueryHandler(handle_stopask, pattern="^stopask:"))
+    application.add_handler(CallbackQueryHandler(handle_stopyes, pattern="^stopyes:"))
+    application.add_handler(CallbackQueryHandler(handle_stopno, pattern="^stopno$"))
+    application.add_handler(CallbackQueryHandler(handle_editmenu, pattern="^editmenu:"))
+    application.add_handler(CallbackQueryHandler(handle_addopt, pattern="^addopt:"))
+    application.add_handler(CallbackQueryHandler(handle_kickmenu, pattern="^kickmenu:"))
+    application.add_handler(CallbackQueryHandler(handle_kick, pattern="^kick:"))
+    application.add_handler(CallbackQueryHandler(handle_editclose, pattern="^editclose$"))
     application.add_handler(
         ChatMemberHandler(track_chats, ChatMemberHandler.MY_CHAT_MEMBER)
     )

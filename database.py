@@ -39,16 +39,18 @@ def init_db(path: str = DB_PATH):
             );
 
             CREATE TABLE IF NOT EXISTS poll_options (
-                option_id   INTEGER PRIMARY KEY AUTOINCREMENT,
-                poll_id     INTEGER NOT NULL REFERENCES polls(poll_id) ON DELETE CASCADE,
-                option_text TEXT NOT NULL,
-                position    INTEGER NOT NULL
+                option_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+                poll_id       INTEGER NOT NULL REFERENCES polls(poll_id) ON DELETE CASCADE,
+                option_text   TEXT NOT NULL,
+                position      INTEGER NOT NULL,
+                manual_votes  INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS votes (
                 poll_id     INTEGER NOT NULL REFERENCES polls(poll_id) ON DELETE CASCADE,
                 user_id     INTEGER NOT NULL,
                 option_id   INTEGER NOT NULL REFERENCES poll_options(option_id) ON DELETE CASCADE,
+                voter_name  TEXT,
                 voted_at    TEXT DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (poll_id, user_id)
             );
@@ -57,6 +59,17 @@ def init_db(path: str = DB_PATH):
             CREATE INDEX IF NOT EXISTS idx_votes_poll ON votes(poll_id);
             """
         )
+        # --- migration guard: আগের ভার্সনে বানানো পুরনো DB ফাইলে নতুন কলাম
+        # যোগ করে দেয় (নতুন feature গুলোর জন্য দরকার), না থাকলে চুপচাপ এগিয়ে যায়।
+        for alter_sql in (
+            "ALTER TABLE poll_options ADD COLUMN manual_votes INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE votes ADD COLUMN voter_name TEXT",
+        ):
+            try:
+                conn.execute(alter_sql)
+                conn.commit()
+            except sqlite3.OperationalError:
+                pass  # কলাম আগে থেকেই আছে
 
 
 @contextmanager
@@ -146,7 +159,26 @@ def get_options(poll_id: int):
         ).fetchall()
 
 
-def try_claim_option(poll_id: int, user_id: int, option_id: int) -> str:
+def add_option(poll_id: int, option_text: str, manual_votes: int = 0) -> int:
+    """
+    এডমিন পোল এডিট করার সময় নতুন অপশন যোগ করে। manual_votes দিয়ে অপশনটা
+    শুরুতেই একটা প্রি-সেট ভোট সংখ্যা নিয়ে শুরু করতে পারে (যেমন "নাম,10"
+    দিলে সেই অপশন ১০ ভোট নিয়ে শুরু হবে এবং তারপর থেকে আসল ভোট যোগ হতে থাকবে)।
+    """
+    with _lock, _connect() as conn:
+        next_pos = conn.execute(
+            "SELECT COALESCE(MAX(position), -1) + 1 FROM poll_options WHERE poll_id=?",
+            (poll_id,),
+        ).fetchone()[0]
+        cur = conn.execute(
+            "INSERT INTO poll_options (poll_id, option_text, position, manual_votes) "
+            "VALUES (?, ?, ?, ?)",
+            (poll_id, option_text, next_pos, manual_votes),
+        )
+        return cur.lastrowid
+
+
+def try_claim_option(poll_id: int, user_id: int, option_id: int, voter_name: str = None) -> str:
     """
     একজন ইউজার একটা পোলে জীবনে একবারই ভোট দিতে পারবে (যেকোনো একটা অপশনে),
     কিন্তু একটা অপশনে একাধিক ভিন্ন ইউজার ভোট দিতে পারবে — এটা এখন সবার জন্য
@@ -162,8 +194,8 @@ def try_claim_option(poll_id: int, user_id: int, option_id: int) -> str:
 
         try:
             conn.execute(
-                "INSERT INTO votes (poll_id, user_id, option_id) VALUES (?, ?, ?)",
-                (poll_id, user_id, option_id),
+                "INSERT INTO votes (poll_id, user_id, option_id, voter_name) VALUES (?, ?, ?, ?)",
+                (poll_id, user_id, option_id, voter_name),
             )
         except sqlite3.IntegrityError:
             # দুইজন ঠিক একই মুহূর্তে চাপলে race condition — একজন ইউজার একবারই ভোট দিতে পারবে
@@ -172,12 +204,23 @@ def try_claim_option(poll_id: int, user_id: int, option_id: int) -> str:
 
 
 def get_vote_counts(poll_id: int) -> dict:
+    """
+    প্রতিটা অপশনের মোট ভোট = আসল ভোট (votes টেবিল থেকে) + manual_votes
+    (এডমিন এডিট করার সময় প্রি-সেট করা সংখ্যা)।
+    """
     with _lock, _connect() as conn:
-        rows = conn.execute(
+        manual_rows = conn.execute(
+            "SELECT option_id, manual_votes FROM poll_options WHERE poll_id=?",
+            (poll_id,),
+        ).fetchall()
+        real_rows = conn.execute(
             "SELECT option_id, COUNT(*) FROM votes WHERE poll_id=? GROUP BY option_id",
             (poll_id,),
         ).fetchall()
-    return {option_id: count for option_id, count in rows}
+    counts = {option_id: manual for option_id, manual in manual_rows}
+    for option_id, real_count in real_rows:
+        counts[option_id] = counts.get(option_id, 0) + real_count
+    return counts
 
 
 def get_user_vote(poll_id: int, user_id: int):
@@ -188,6 +231,26 @@ def get_user_vote(poll_id: int, user_id: int):
             (poll_id, user_id),
         ).fetchone()
     return row[0] if row else None
+
+
+def list_voters(poll_id: int):
+    """
+    এই পোলে এখন পর্যন্ত যারা (আসল ভোট দিয়ে) ভোট দিয়েছে তাদের তালিকা —
+    "ভোট থেকে বাদ দিন" মেনুতে দেখানোর জন্য। manual_votes এখানে আসবে না,
+    কারণ সেটা কোনো নির্দিষ্ট ইউজারের ভোট না।
+    Returns: [(user_id, voter_name, option_id, option_text), ...]
+    """
+    with _lock, _connect() as conn:
+        return conn.execute(
+            """
+            SELECT v.user_id, v.voter_name, v.option_id, o.option_text
+            FROM votes v
+            JOIN poll_options o ON o.option_id = v.option_id
+            WHERE v.poll_id = ?
+            ORDER BY v.voted_at
+            """,
+            (poll_id,),
+        ).fetchall()
 
 
 def close_poll(poll_id: int):
@@ -211,7 +274,11 @@ def list_open_polls_for_chat(chat_id: int):
 
 
 def delete_vote(poll_id: int, user_id: int) -> bool:
-    """ইউজার চ্যানেল/গ্রুপ ছেড়ে গেলে তার ভোট মুছে দেয়। মুছা হলে True, না থাকলে False।"""
+    """
+    একটা ভোট মুছে দেয় — ইউজার চ্যানেল/গ্রুপ ছেড়ে গেলে অটোমেটিক এই ফাংশন
+    কল হয়, আবার এডমিন 'ভোট থেকে বাদ দিন' মেনু থেকে ম্যানুয়ালি কাউকে বাদ
+    দিলেও এই একই ফাংশন ব্যবহার হয়। মুছা হলে True, না থাকলে False।
+    """
     with _lock, _connect() as conn:
         cur = conn.execute(
             "DELETE FROM votes WHERE poll_id=? AND user_id=?", (poll_id, user_id)
