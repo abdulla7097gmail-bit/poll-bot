@@ -195,3 +195,25 @@ def close_poll(poll_id: int):
         conn.execute(
             "UPDATE polls SET status='closed' WHERE poll_id=?", (poll_id,)
         )
+
+
+def list_open_polls_for_chat(chat_id: int):
+    """
+    কোনো ইউজার একটা চ্যাট থেকে বের হয়ে গেলে, সেই চ্যাটের যত 'open' পোল আছে
+    সবগুলো থেকে তার ভোট মুছে ফেলতে হবে — এই ফাংশন সেই পোলগুলোর তালিকা দেয়।
+    """
+    with _lock, _connect() as conn:
+        return conn.execute(
+            "SELECT poll_id, message_id, question FROM polls "
+            "WHERE chat_id=? AND status='open'",
+            (chat_id,),
+        ).fetchall()
+
+
+def delete_vote(poll_id: int, user_id: int) -> bool:
+    """ইউজার চ্যানেল/গ্রুপ ছেড়ে গেলে তার ভোট মুছে দেয়। মুছা হলে True, না থাকলে False।"""
+    with _lock, _connect() as conn:
+        cur = conn.execute(
+            "DELETE FROM votes WHERE poll_id=? AND user_id=?", (poll_id, user_id)
+        )
+    return cur.rowcount > 0

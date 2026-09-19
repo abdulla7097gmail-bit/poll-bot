@@ -146,6 +146,22 @@ async def user_is_chat_admin(context: ContextTypes.DEFAULT_TYPE, chat_id: int, u
         return False
 
 
+NOT_MEMBER_STATUSES = (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED)
+
+
+async def user_is_chat_member(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int):
+    """
+    ভোট দেওয়ার আগে চেক করে ইউজার আসলেই সেই চ্যানেল/গ্রুপে জয়েন করা আছে কিনা।
+    Returns: True (জয়েন করা আছে) / False (জয়েন করা নেই বা বের হয়ে গেছে) / None (যাচাই করা যায়নি)
+    """
+    try:
+        member = await context.bot.get_chat_member(chat_id, user_id)
+    except Exception as e:
+        logger.warning("membership check failed for chat %s user %s: %s", chat_id, user_id, e)
+        return None
+    return member.status not in NOT_MEMBER_STATUSES
+
+
 # ---------------------------------------------------------------------------
 # my_chat_member — বট কোন চ্যানেল/গ্রুপে এডমিন/মেম্বার হলে/বাদ পড়লে রেজিস্টার করে
 # ---------------------------------------------------------------------------
@@ -156,6 +172,53 @@ async def track_chats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     new_status = result.new_chat_member.status
     db.upsert_chat(chat.id, chat.title or chat.full_name or str(chat.id), chat.type, new_status)
     logger.info("chat %s (%s) -> status %s", chat.id, chat.title, new_status)
+
+
+# ---------------------------------------------------------------------------
+# chat_member — সাধারণ ইউজারদের জয়েন/লিভ ট্র্যাক করে (my_chat_member থেকে আলাদা,
+# ওটা শুধু বটের নিজের স্ট্যাটাস বদলালে ট্রিগার হয়)। কেউ চ্যানেল/গ্রুপ ছেড়ে গেলে
+# সেই চ্যাটের সব 'open' পোল থেকে তার ভোট অটোমেটিক মুছে ফেলে ও লাইভ কাউন্ট আপডেট করে।
+# ---------------------------------------------------------------------------
+
+async def track_chat_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    result = update.chat_member
+    if result is None:
+        return
+
+    user = result.new_chat_member.user
+    if user.is_bot:
+        return
+
+    old_status = result.old_chat_member.status
+    new_status = result.new_chat_member.status
+
+    was_member = old_status not in NOT_MEMBER_STATUSES
+    now_left = new_status in NOT_MEMBER_STATUSES
+    if not (was_member and now_left):
+        return  # শুধু 'জয়েন করা ছিল -> এখন বের হয়ে গেছে/ব্যান হয়েছে' কেসেই কাজ করবে
+
+    chat_id = result.chat.id
+    for poll_id, message_id, question in db.list_open_polls_for_chat(chat_id):
+        if not db.delete_vote(poll_id, user.id):
+            continue  # এই পোলে সে ভোটই দেয়নি
+
+        logger.info(
+            "user %s left chat %s -> vote removed from poll %s", user.id, chat_id, poll_id
+        )
+        option_rows = db.get_options(poll_id)
+        counts = db.get_vote_counts(poll_id)
+        total = sum(counts.values())
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=build_poll_text(question, total),
+                reply_markup=build_poll_keyboard(poll_id, option_rows, counts),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as e:
+            if "not modified" not in str(e).lower():
+                logger.warning("leave-vote-removal edit failed: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -190,6 +253,13 @@ HELP_TEXT = (
     "৫. পোল পোস্ট হয়ে যাবে — যে কেউ বাটনে চেপে ভোট দিতে পারবে।\n"
     "৬. শুধু ওই চ্যানেল/গ্রুপের <b>এডমিনরাই</b> \"🔴 থামান এবং ফলাফল পান\" বাটনে চেপে "
     "পোল বন্ধ করতে পারবে ও ফলাফল দেখতে পারবে।\n\n"
+    "🛡 <b>ফেক ভোট প্রতিরোধ:</b>\n"
+    "• যে চ্যানেল/গ্রুপে পোল পোস্ট হয়েছে, সেখানে জয়েন করা না থাকলে ভোট দেওয়া যাবে না।\n"
+    "• ভোট দেওয়ার পর কেউ চ্যানেল/গ্রুপ ছেড়ে গেলে তার ভোট অটোমেটিক মুছে যাবে ও লাইভ "
+    "কাউন্ট আপডেট হবে।\n"
+    "• প্রতি ইউজার প্রতি পোলে একবারই ভোট দিতে পারবে, বট অ্যাকাউন্ট ভোট দিতে পারবে না।\n"
+    "• (একজন মানুষের একাধিক টেলিগ্রাম অ্যাকাউন্ট বা একাধিক ডিভাইস ব্যবহার করা টেলিগ্রামের "
+    "নিয়মেই ঠেকানো সম্ভব নয় — এটা এই প্রযুক্তির সীমাবদ্ধতা।)\n\n"
     "কমান্ড: /start /newpoll /mychats /cancel /help\n"
     "অথবা নিচের মেনু থেকে সরাসরি বেছে নিন 👇"
 )
@@ -396,7 +466,28 @@ async def handle_vote(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("এই পোলটি ইতিমধ্যে বন্ধ হয়ে গেছে।", show_alert=True)
         return
 
-    result = db.try_claim_option(poll_id, update.effective_user.id, option_id)
+    voter = update.effective_user
+
+    # ---- ফেক ভোট ঠেকানোর চেক ১: বট অ্যাকাউন্ট দিয়ে ভোট দেওয়া বন্ধ ----
+    if voter.is_bot:
+        await query.answer("বট অ্যাকাউন্ট দিয়ে ভোট দেওয়া যাবে না।", show_alert=True)
+        return
+
+    # ---- ফেক ভোট ঠেকানোর চেক ২: চ্যানেল/গ্রুপে জয়েন করা আছে কিনা যাচাই ----
+    is_member = await user_is_chat_member(context, chat_id, voter.id)
+    if is_member is None:
+        await query.answer(
+            "মেম্বারশিপ যাচাই করা যাচ্ছে না, একটু পর আবার চেষ্টা করুন।", show_alert=True
+        )
+        return
+    if is_member is False:
+        await query.answer(
+            "❗ আপনি এখনো এই চ্যানেল/গ্রুপে জয়েন করেননি।\nনিয়ম অনুযায়ী ভোট দিতে হলে আগে জয়েন করতে হবে।",
+            show_alert=True,
+        )
+        return
+
+    result = db.try_claim_option(poll_id, voter.id, option_id)
 
     if result == "already_voted":
         await query.answer(
@@ -579,6 +670,9 @@ def main():
     application.add_handler(CallbackQueryHandler(handle_stop, pattern="^stop:"))
     application.add_handler(
         ChatMemberHandler(track_chats, ChatMemberHandler.MY_CHAT_MEMBER)
+    )
+    application.add_handler(
+        ChatMemberHandler(track_chat_members, ChatMemberHandler.CHAT_MEMBER)
     )
 
     logger.info("বট চালু হচ্ছে...")
